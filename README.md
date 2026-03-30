@@ -55,13 +55,19 @@ After patching, the binary is ad-hoc re-signed with `codesign -s -` on macOS.
 # Apply the patch
 ./patch.sh
 
+# Check current status without modifying
+./patch.sh --check
+
+# Restore original binary from backup
+./patch.sh --restore
+
 # Use a specific binary path
 ./patch.sh /path/to/claude
 ```
 
 The patcher automatically:
 1. Locates the Claude Code binary (follows symlinks from `which claude`)
-2. Finds the title-gate pattern by searching for `d5.current=!0,` near `.then(` (title generator promise chain)
+2. Finds the title-gate pattern by searching for `.current=!0,` near `AbortController` (uniquely identifies the title guard vs hundreds of other React ref assignments)
 3. Creates a backup (`.bak` alongside the binary)
 4. Applies the single-byte replacement
 5. Re-signs the binary (macOS only)
@@ -77,7 +83,7 @@ Updates replace the binary, removing the patch. Re-run `./patch.sh` after each u
 | Version | Gate pattern | Anchor | Status |
 |---|---|---|---|
 | < 2.1.87 | `messages.length<=1` | `length<=1` near `.then(` | First-message bug: system messages inflated count, title never fired |
-| 2.1.87 | `d5.current=!0` (one-shot ref) | `.current=!0,` near `.then(` | First-message fixed upstream, but still one-shot |
+| 2.1.87 | `d5.current=!0` (one-shot ref) | `.current=!0,` near `AbortController` | First-message fixed upstream, but still one-shot |
 
 ### Tested versions
 
@@ -88,11 +94,12 @@ Updates replace the binary, removing the patch. Re-run `./patch.sh` after each u
 ## Restoring
 
 ```bash
-# The backup is created alongside the binary
-cp /path/to/claude.bak /path/to/claude
+# Via the patcher
+./patch.sh --restore
 
-# Re-sign on macOS
-codesign --sign - --force /path/to/claude
+# Or manually
+cp /path/to/claude.bak /path/to/claude
+codesign --sign - --force /path/to/claude  # macOS only
 ```
 
 ## Context
