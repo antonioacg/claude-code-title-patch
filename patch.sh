@@ -2,28 +2,28 @@
 # Claude Code Terminal Title Patch
 #
 # Problem: Claude Code generates a terminal title from the first user message
-# but never updates it again, even when the conversation changes topic.
+# but never updates it again, even when the conversation changes topic. It also
+# skips title generation entirely on resumed sessions.
 #
-# The title generation code (onBeforeQuery handler, v2.1.87 minified names):
+# Two patch sites (v2.1.87 minified names shown):
 #
-#   if (!yA && !G5 && !Ez && !d5.current) {
-#     let bz = x_.find((yO) => yO.type === "user" && !yO.isMeta);
-#     let Iz = bz?.type === "user" ? AF(bz.message.content) : null;
-#     if (Iz && !Iz.startsWith(...))
-#       d5.current = !0,  // <-- one-shot guard: never fires again
-#       i9H(Iz, new AbortController().signal).then((yO) => {
-#         if (yO) m3(yO); else d5.current = false
-#       }, () => { d5.current = false })
-#   }
+# 1. onBeforeQuery handler — one-shot guard prevents re-generation:
 #
-# Fix: Change `!0` (true) to `!1` (false) in the guard assignment. This is a
-# single byte change (0x30 -> 0x31). The guard stays false, so the title
-# generator fires on every user message. The generator uses model inference
-# to decide if the message warrants a new title, so repeated calls are harmless.
+#      d5.current = !0,  // <-- fires once, then blocks forever
+#      i9H(Iz, new AbortController().signal).then(...)
 #
-# Anchor: `.current=!0,` followed by `AbortController` within ~100 bytes
-# uniquely identifies the title-gate guard (vs hundreds of other `.current=!0`
-# occurrences in React code).
+#    Anchor: `.current=!0,` near `AbortController` (~120 bytes)
+#
+# 2. Session resume handler — guard blocks title gen for restored sessions:
+#
+#      d5.current = !0, m3(void 0)  // <-- blocks + clears title
+#      ... Q("tengu_session_resumed", ...)
+#
+#    Anchor: `.current=!0,` near `tengu_session_resumed` (~300 bytes)
+#
+# Fix: Change `!0` (true) to `!1` (false) at both sites. Single byte change
+# each (0x30 -> 0x31). The title generator uses model inference to decide if
+# the message warrants a new title, so repeated calls are harmless.
 #
 # The patch is overwritten on each Claude Code auto-update. Re-run after.
 #
@@ -81,14 +81,17 @@ if [[ "$RESTORE" == true ]]; then
   exit 0
 fi
 
-# --- Find pattern ---
-# Strategy: search for `.current=!0,` and `.current=!1,` byte offsets, then
-# check if `AbortController` appears within the next ~100 bytes. This
-# distinguishes the title-gate guard from hundreds of other React ref
-# assignments.
+# --- Find patterns ---
+# Both patch sites share `.current=!0,` but are distinguished by what follows:
+#   - onBeforeQuery:  `AbortController` within ~120 bytes
+#   - session resume: `tengu_session_resumed` within ~300 bytes
+# We search for `.current=!0,` (unpatched) or `.current=!1,` (patched) and
+# filter by nearby anchor strings.
 
-find_title_offsets() {
-  local pattern="$1"
+# Searches for `.current=!{0|1},` and filters by a nearby anchor string.
+# Args: $1=pattern (.current=!0, or .current=!1,), $2=anchor, $3=scan range
+find_offsets() {
+  local pattern="$1" anchor="$2" range="${3:-120}"
   local offsets=()
   while IFS=: read -r offset _; do
     offsets+=("$offset")
@@ -97,38 +100,55 @@ find_title_offsets() {
   local matches=()
   for offset in "${offsets[@]}"; do
     local context
-    context=$(dd if="$BINARY" bs=1 skip="$offset" count=120 2>/dev/null | strings -n 5)
-    if echo "$context" | grep -q 'AbortController'; then
+    context=$(dd if="$BINARY" bs=1 skip="$offset" count="$range" 2>/dev/null | strings -n 5)
+    if echo "$context" | grep -q "$anchor"; then
       matches+=("$offset")
     fi
   done
-
   echo "${matches[@]}"
 }
 
-# Check if already patched
-read -ra PATCHED <<< "$(find_title_offsets '.current=!1,')"
+# Patch site definitions: name, anchor string, scan range
+SITES=("onBeforeQuery:AbortController:120" "sessionResume:tengu_session_resumed:300")
 
-if [[ ${#PATCHED[@]} -gt 0 ]]; then
-  echo "Status: patched (${#PATCHED[@]} occurrence(s))"
+ALL_PATCHED=0
+ALL_UNPATCHED=0
+PATCH_OFFSETS=()
+
+for site in "${SITES[@]}"; do
+  IFS=: read -r name anchor range <<< "$site"
+
+  read -ra patched <<< "$(find_offsets '.current=!1,' "$anchor" "$range")"
+  read -ra unpatched <<< "$(find_offsets '.current=!0,' "$anchor" "$range")"
+
+  if [[ ${#patched[@]} -gt 0 && "${patched[0]}" != "" ]]; then
+    echo "  $name: patched (${#patched[@]})"
+    ALL_PATCHED=$((ALL_PATCHED + ${#patched[@]}))
+  elif [[ ${#unpatched[@]} -gt 0 && "${unpatched[0]}" != "" ]]; then
+    echo "  $name: unpatched (${#unpatched[@]})"
+    ALL_UNPATCHED=$((ALL_UNPATCHED + ${#unpatched[@]}))
+    PATCH_OFFSETS+=("${unpatched[@]}")
+  else
+    echo "  $name: not found"
+  fi
+done
+
+if [[ $ALL_UNPATCHED -eq 0 && $ALL_PATCHED -gt 0 ]]; then
+  echo "Status: patched ($ALL_PATCHED occurrence(s))"
   [[ "$CHECK_ONLY" == true ]] && exit 0
   echo "Already patched — nothing to do"
   exit 0
 fi
 
-# Find unpatched pattern
-read -ra UNPATCHED <<< "$(find_title_offsets '.current=!0,')"
-
-if [[ ${#UNPATCHED[@]} -eq 0 ]]; then
+if [[ $ALL_UNPATCHED -eq 0 && $ALL_PATCHED -eq 0 ]]; then
   echo "Status: unknown"
   echo "ERROR: Could not find the expected code pattern in this binary." >&2
   echo "This version of Claude Code may not be compatible with this patch." >&2
-  echo "Run with --check for details." >&2
   exit 1
 fi
 
 echo "Status: unpatched"
-echo "Found ${#UNPATCHED[@]} title-gate occurrence(s)"
+echo "Found ${#PATCH_OFFSETS[@]} occurrence(s) to patch"
 
 if [[ "$CHECK_ONLY" == true ]]; then
   exit 0
@@ -146,7 +166,7 @@ fi
 # --- Patch ---
 # `.current=!0,` — the `0` is at byte 10 (0-indexed): . c u r r e n t = ! 0
 #                                                      0 1 2 3 4 5 6 7 8 9 10
-for offset in "${UNPATCHED[@]}"; do
+for offset in "${PATCH_OFFSETS[@]}"; do
   patch_offset=$((offset + 10))
 
   # Verify we're patching the right byte (0x30 = '0')
