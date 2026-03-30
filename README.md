@@ -1,0 +1,106 @@
+# Claude Code Terminal Title Patch
+
+Patches the Claude Code binary so the terminal title **updates on every user message**, not just the first one.
+
+Without this patch, Claude Code generates a title from the first user message and never updates it again. If the conversation shifts topic, the title stays stale for the rest of the session.
+
+## How it works
+
+### The title generation gate
+
+The `onBeforeQuery` handler in Claude Code's React component generates terminal titles. The relevant code (v2.1.87, minified names vary by version):
+
+```javascript
+// d5 is a useRef — one-shot guard, starts as false
+// m3 is the title setter — m3(title) updates the terminal title
+// i9H is the title generator — calls the model to produce a short title
+
+if (!yA && !G5 && !Ez && !d5.current) {
+  let bz = x_.find((yO) => yO.type === "user" && !yO.isMeta);
+  let Iz = bz?.type === "user" ? AF(bz.message.content) : null;
+  if (Iz && !Iz.startsWith(...))
+    d5.current = true,  // <-- one-shot: never fires again
+    i9H(Iz, new AbortController().signal).then((yO) => {
+      if (yO) m3(yO); else d5.current = false
+    }, () => { d5.current = false })
+}
+```
+
+The title priority chain: `G5 ?? Ez ?? F4 ?? "Claude Code"` — rename title > agent type > generated title > fallback.
+
+### The fix
+
+Change `d5.current=!0` (sets guard to `true`) to `d5.current=!1` (keeps guard `false`):
+
+| | Hex | ASCII |
+|---|---|---|
+| Original | `21 30` | `!0` (truthy) |
+| Patched | `21 31` | `!1` (falsy) |
+
+This is a **single byte change** (`0x30` -> `0x31`) at a known anchor pattern. Since the guard stays `false`, the title generator fires on every `onBeforeQuery`. The generator itself uses model inference to decide if the message warrants a new title, so repeated calls are harmless.
+
+The `d5` ref is still reset properly on session resume (`d5.current=!1, m3(void 0)`) and on new conversations, so those paths are unaffected.
+
+After patching, the binary is ad-hoc re-signed with `codesign -s -` on macOS.
+
+## Requirements
+
+- Bash
+- Claude Code installed as a compiled binary (mise, standalone download)
+- `grep`, `dd`, `xxd`, `strings` (standard on macOS and Linux)
+
+## Usage
+
+```bash
+# Apply the patch
+./patch.sh
+
+# Use a specific binary path
+./patch.sh /path/to/claude
+```
+
+The patcher automatically:
+1. Locates the Claude Code binary (follows symlinks from `which claude`)
+2. Finds the title-gate pattern by searching for `d5.current=!0,` near `.then(` (title generator promise chain)
+3. Creates a backup (`.bak` alongside the binary)
+4. Applies the single-byte replacement
+5. Re-signs the binary (macOS only)
+
+### After Claude Code updates
+
+Updates replace the binary, removing the patch. Re-run `./patch.sh` after each update.
+
+## Version history
+
+### Gate pattern changes
+
+| Version | Gate pattern | Anchor | Status |
+|---|---|---|---|
+| < 2.1.87 | `messages.length<=1` | `length<=1` near `.then(` | First-message bug: system messages inflated count, title never fired |
+| 2.1.87 | `d5.current=!0` (one-shot ref) | `.current=!0,` near `.then(` | First-message fixed upstream, but still one-shot |
+
+### Tested versions
+
+| Claude Code | Platform | Status | Notes |
+|---|---|---|---|
+| 2.1.87 | macOS arm64 (mise) | Tested | Bun Mach-O, 2 occurrences (code + source map) |
+
+## Restoring
+
+```bash
+# The backup is created alongside the binary
+cp /path/to/claude.bak /path/to/claude
+
+# Re-sign on macOS
+codesign --sign - --force /path/to/claude
+```
+
+## Context
+
+- The upstream bug where titles never fired (pre-2.1.87) was tracked but the fix only made it one-shot
+- The `terminalTitleFromRename` setting controls whether `/name` overrides the generated title, but there is no setting to enable re-generation on topic changes
+- The title generator uses model inference, so it naturally handles topic detection
+
+## License
+
+MIT
