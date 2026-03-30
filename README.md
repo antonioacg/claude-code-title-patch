@@ -123,6 +123,31 @@ cp /path/to/claude.bak /path/to/claude
 codesign --sign - --force /path/to/claude  # macOS only
 ```
 
+## Known limitation: title on resume requires first message
+
+With the current patch, resumed sessions show "Claude Code" until the first user message triggers title generation. Ideally the title would generate immediately on load. Research into possible approaches:
+
+### Why it's hard
+
+The title generator (`i9H`) needs a user message string, an `AbortController` signal, and calls `m3(title)` on success. The resume handler has access to `V8` (messages array) and `m3`, but injecting a full `i9H(...)` call requires ~107 bytes — far more than the 10-byte `m3(void 0)` it would replace.
+
+### Possible approaches
+
+**A. Byte-budget compression** (like the theme patch). Compress nearby code in the resume handler to free ~80+ bytes, then inject:
+```javascript
+i9H(AF(V8.findLast(m=>m.type==="user"&&!m.isMeta)?.message?.content),
+    new AbortController().signal).then(m3)
+```
+This is the most correct approach but requires identifying compressible patterns in the surrounding ~500 bytes — `===` → `==`, `!==null` → `!=null`, inlining small functions, etc. Each version needs a new compression budget analysis.
+
+**B. Hijack a no-op `useEffect`**. The component has empty effects like `useEffect(()=>{},[OM,bL,tP])` where `bL` is the last message. Replacing the body with a title generation call would fire when messages load. Risk: the effect watches scroll state (`tP`) too, and may fire too often.
+
+**C. Use session metadata**. The session index on disk stores a `summary` field (the generated title), but the resume handler's `x_` metadata doesn't include it — only `agentName`, `agentColor`, `fullPath`, `projectPath`, `worktreeSession`, and `contentReplacements`. Loading summary into the resume path would require a deeper patch.
+
+**D. External trigger**. A shell hook that reads the session index JSON after launch and sets the terminal title via escape sequences (`\033]0;title\007`). No binary patching needed, but requires detecting which session was resumed and timing the write after Claude Code loads.
+
+Approach A is the most robust. Approach D is the simplest to implement without binary changes.
+
 ## Context
 
 - The upstream bug where titles never fired (pre-2.1.87) was tracked but the fix only made it one-shot
