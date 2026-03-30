@@ -27,7 +27,9 @@
 #
 #      d5 = useRef(($?.length ?? 0) > 0)  // <-- true on resume
 #
-#    Pattern: `useRef(($?.length??0)>0)` near `"Claude Code"` (~80 bytes)
+#    Pattern: `.length??0)>0)` near `"Claude Code"` (~80 bytes)
+#    Note: The useRef call and variable name vary across platforms
+#    (e.g. `A6.useRef(($?.length??0)>0)` on macOS, `w6.useRef((O?.length??0)>0)` on Linux)
 #    Fix: `>0)` -> `<0)` (0x3e -> 0x3c) — length is never negative, so always false
 #
 # The title generator uses model inference to decide if the message warrants
@@ -59,12 +61,23 @@ done
 
 # --- Resolve binary ---
 if [[ -z "$BINARY" ]]; then
-  BINARY=$(command -v claude 2>/dev/null) || true
-  if [[ -z "$BINARY" ]]; then
-    echo "error: 'claude' not found on PATH" >&2
-    exit 1
+  # 1. mise installs directory (avoids shim → mise symlink problem)
+  mise_dir="$HOME/.local/share/mise/installs/claude"
+  if [[ -d "$mise_dir" ]]; then
+    latest=$(ls -1 "$mise_dir" | sort -V | tail -1)
+    if [[ -n "$latest" && -f "$mise_dir/$latest/claude" ]]; then
+      BINARY="$mise_dir/$latest/claude"
+    fi
   fi
-  BINARY=$(readlink -f "$BINARY" 2>/dev/null || realpath "$BINARY" 2>/dev/null || echo "$BINARY")
+  # 2. which + realpath
+  if [[ -z "$BINARY" ]]; then
+    BINARY=$(command -v claude 2>/dev/null) || true
+    if [[ -z "$BINARY" ]]; then
+      echo "error: 'claude' not found on PATH" >&2
+      exit 1
+    fi
+    BINARY=$(readlink -f "$BINARY" 2>/dev/null || realpath "$BINARY" 2>/dev/null || echo "$BINARY")
+  fi
 fi
 
 if [[ ! -f "$BINARY" ]]; then
@@ -133,7 +146,7 @@ patch_byte() {
 SITES=(
   "onBeforeQuery|.current=!0,|.current=!1,|AbortController|120|10|30|31"
   "sessionResume|.current=!0,|.current=!1,|tengu_session_resumed|300|10|30|31"
-  "guardInit|useRef((\$?.length??0)>0)|useRef((\$?.length??0)<0)|Claude Code|80|21|3e|3c"
+  "guardInit|.length??0)>0)|.length??0)<0)|Claude Code|80|11|3e|3c"
 )
 
 ALL_PATCHED=0

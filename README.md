@@ -48,7 +48,7 @@ The guard ref is initialized with the current message count. On resume, messages
 d5 = useRef(($?.length ?? 0) > 0)  // true when resuming (messages exist)
 ```
 
-Anchor: `useRef(($?.length??0)>0)` near `"Claude Code"` (~80 bytes).
+Pattern: `.length??0)>0)` near `"Claude Code"` (~80 bytes). The `useRef` call and variable name are minified differently per platform (e.g. `A6.useRef(($?...` on macOS, `w6.useRef((O?...` on Linux), so the grep pattern starts at `.length`.
 
 ### The fix
 
@@ -60,7 +60,7 @@ Anchor: `useRef(($?.length??0)>0)` near `"Claude Code"` (~80 bytes).
 
 Single byte change per site. Since the guard stays `false`, the title generator fires on every `onBeforeQuery` — including after session resume. The generator uses model inference to decide if the message warrants a new title, so repeated calls are harmless.
 
-The title priority chain: `G5 ?? Ez ?? F4 ?? "Claude Code"` — rename title > agent type > generated title > fallback.
+The title priority chain: `renameTitle ?? agentType ?? generatedTitle ?? "Claude Code"` — rename title > agent type > generated title > fallback. (Minified names vary per platform, e.g. `G5 ?? Ez ?? F4` on macOS, `Gz ?? E$ ?? d5` on Linux.)
 
 After patching, the binary is ad-hoc re-signed with `codesign -s -` on macOS.
 
@@ -87,7 +87,7 @@ After patching, the binary is ad-hoc re-signed with `codesign -s -` on macOS.
 ```
 
 The patcher automatically:
-1. Locates the Claude Code binary (follows symlinks from `which claude`)
+1. Locates the Claude Code binary (checks mise installs directory first, falls back to `which claude`)
 2. Finds all three patch sites by searching for unique anchor patterns near each
 3. Creates a backup (`.bak` alongside the binary)
 4. Applies the single-byte replacement at each site
@@ -111,6 +111,7 @@ Updates replace the binary, removing the patch. Re-run `./patch.sh` after each u
 | Claude Code | Platform | Status | Notes |
 |---|---|---|---|
 | 2.1.87 | macOS arm64 (mise) | Tested | Bun Mach-O, 6 occurrences (3 sites x 2 code/source map) |
+| 2.1.87-linux | Linux x86_64 (mise) | Tested | Bun ELF, 6 occurrences (3 sites x 2 code/source map) |
 
 ## Restoring
 
