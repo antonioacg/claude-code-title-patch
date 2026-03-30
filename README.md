@@ -40,16 +40,25 @@ Q("tengu_session_resumed", { entrypoint: ..., success: true })
 
 Anchor: `.current=!0,` near `tengu_session_resumed` (~300 bytes).
 
+### Patch site 3: guard initialization — ref starts true on resume
+
+The guard ref is initialized with the current message count. On resume, messages already exist, so it starts as `true` — blocking title generation before the resume handler even runs:
+
+```javascript
+d5 = useRef(($?.length ?? 0) > 0)  // true when resuming (messages exist)
+```
+
+Anchor: `useRef(($?.length??0)>0)` near `"Claude Code"` (~80 bytes).
+
 ### The fix
 
-Change `!0` (true) to `!1` (false) at **both** sites:
+| Site | Original | Patched | Byte change |
+|---|---|---|---|
+| onBeforeQuery | `!0` (true) | `!1` (false) | `0x30` -> `0x31` |
+| sessionResume | `!0` (true) | `!1` (false) | `0x30` -> `0x31` |
+| guardInit | `>0)` (true on resume) | `<0)` (always false) | `0x3e` -> `0x3c` |
 
-| | Hex | ASCII |
-|---|---|---|
-| Original | `21 30` | `!0` (truthy) |
-| Patched | `21 31` | `!1` (falsy) |
-
-Single byte change (`0x30` -> `0x31`) per site. Since the guard stays `false`, the title generator fires on every `onBeforeQuery` — including after session resume. The generator uses model inference to decide if the message warrants a new title, so repeated calls are harmless.
+Single byte change per site. Since the guard stays `false`, the title generator fires on every `onBeforeQuery` — including after session resume. The generator uses model inference to decide if the message warrants a new title, so repeated calls are harmless.
 
 The title priority chain: `G5 ?? Ez ?? F4 ?? "Claude Code"` — rename title > agent type > generated title > fallback.
 
@@ -79,7 +88,7 @@ After patching, the binary is ad-hoc re-signed with `codesign -s -` on macOS.
 
 The patcher automatically:
 1. Locates the Claude Code binary (follows symlinks from `which claude`)
-2. Finds both patch sites by searching for `.current=!0,` near unique anchors (`AbortController` for the query gate, `tengu_session_resumed` for the resume gate)
+2. Finds all three patch sites by searching for unique anchor patterns near each
 3. Creates a backup (`.bak` alongside the binary)
 4. Applies the single-byte replacement at each site
 5. Re-signs the binary (macOS only)
@@ -95,13 +104,13 @@ Updates replace the binary, removing the patch. Re-run `./patch.sh` after each u
 | Version | Gate pattern | Anchor | Status |
 |---|---|---|---|
 | < 2.1.87 | `messages.length<=1` | `length<=1` near `.then(` | First-message bug: system messages inflated count, title never fired |
-| 2.1.87 | `d5.current=!0` (one-shot ref) | `.current=!0,` near `AbortController` | First-message fixed upstream, but still one-shot |
+| 2.1.87 | `d5.current=!0` (one-shot ref) + `useRef(>0)` (init) | 3 sites: query gate, resume handler, ref init | First-message fixed upstream, but one-shot + no resume titles |
 
 ### Tested versions
 
 | Claude Code | Platform | Status | Notes |
 |---|---|---|---|
-| 2.1.87 | macOS arm64 (mise) | Tested | Bun Mach-O, 4 occurrences (2 sites x 2 code/source map) |
+| 2.1.87 | macOS arm64 (mise) | Tested | Bun Mach-O, 6 occurrences (3 sites x 2 code/source map) |
 
 ## Restoring
 

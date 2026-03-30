@@ -5,7 +5,7 @@
 # but never updates it again, even when the conversation changes topic. It also
 # skips title generation entirely on resumed sessions.
 #
-# Two patch sites (v2.1.87 minified names shown):
+# Three patch sites (v2.1.87 minified names shown):
 #
 # 1. onBeforeQuery handler — one-shot guard prevents re-generation:
 #
@@ -13,6 +13,7 @@
 #      i9H(Iz, new AbortController().signal).then(...)
 #
 #    Anchor: `.current=!0,` near `AbortController` (~120 bytes)
+#    Fix: `!0` -> `!1` (0x30 -> 0x31)
 #
 # 2. Session resume handler — guard blocks title gen for restored sessions:
 #
@@ -20,10 +21,17 @@
 #      ... Q("tengu_session_resumed", ...)
 #
 #    Anchor: `.current=!0,` near `tengu_session_resumed` (~300 bytes)
+#    Fix: `!0` -> `!1` (0x30 -> 0x31)
 #
-# Fix: Change `!0` (true) to `!1` (false) at both sites. Single byte change
-# each (0x30 -> 0x31). The title generator uses model inference to decide if
-# the message warrants a new title, so repeated calls are harmless.
+# 3. Guard initialization — ref starts true when messages exist (resume):
+#
+#      d5 = useRef(($?.length ?? 0) > 0)  // <-- true on resume
+#
+#    Pattern: `useRef(($?.length??0)>0)` near `"Claude Code"` (~80 bytes)
+#    Fix: `>0)` -> `<0)` (0x3e -> 0x3c) — length is never negative, so always false
+#
+# The title generator uses model inference to decide if the message warrants
+# a new title, so repeated calls are harmless.
 #
 # The patch is overwritten on each Claude Code auto-update. Re-run after.
 #
@@ -82,14 +90,12 @@ if [[ "$RESTORE" == true ]]; then
 fi
 
 # --- Find patterns ---
-# Both patch sites share `.current=!0,` but are distinguished by what follows:
-#   - onBeforeQuery:  `AbortController` within ~120 bytes
-#   - session resume: `tengu_session_resumed` within ~300 bytes
-# We search for `.current=!0,` (unpatched) or `.current=!1,` (patched) and
-# filter by nearby anchor strings.
+# Each patch site has: a grep pattern (unpatched/patched), an anchor string
+# in nearby bytes, a scan range, a byte offset within the pattern to change,
+# and the expected/replacement hex bytes.
 
-# Searches for `.current=!{0|1},` and filters by a nearby anchor string.
-# Args: $1=pattern (.current=!0, or .current=!1,), $2=anchor, $3=scan range
+# Searches for a pattern and filters by a nearby anchor string.
+# Args: $1=pattern, $2=anchor, $3=scan range
 find_offsets() {
   local pattern="$1" anchor="$2" range="${3:-120}"
   local offsets=()
@@ -108,26 +114,47 @@ find_offsets() {
   echo "${matches[@]}"
 }
 
-# Patch site definitions: name, anchor string, scan range
-SITES=("onBeforeQuery:AbortController:120" "sessionResume:tengu_session_resumed:300")
+# Patch a single byte at a given offset.
+# Args: $1=offset, $2=expected hex, $3=replacement hex
+patch_byte() {
+  local offset="$1" expected="$2" replacement="$3"
+  local current_hex
+  current_hex=$(dd if="$BINARY" bs=1 skip="$offset" count=1 2>/dev/null | xxd -p)
+  if [[ "$current_hex" != "$expected" ]]; then
+    echo "warning: unexpected byte at offset $offset: 0x$current_hex (expected 0x$expected), skipping" >&2
+    return 1
+  fi
+  printf "\\x$replacement" | dd of="$BINARY" bs=1 seek="$offset" conv=notrunc 2>/dev/null
+  return 0
+}
+
+# --- Patch site definitions ---
+# Format: name|unpatched_pattern|patched_pattern|anchor|range|byte_offset|from_hex|to_hex
+SITES=(
+  "onBeforeQuery|.current=!0,|.current=!1,|AbortController|120|10|30|31"
+  "sessionResume|.current=!0,|.current=!1,|tengu_session_resumed|300|10|30|31"
+  "guardInit|useRef((\$?.length??0)>0)|useRef((\$?.length??0)<0)|Claude Code|80|21|3e|3c"
+)
 
 ALL_PATCHED=0
 ALL_UNPATCHED=0
-PATCH_OFFSETS=()
+declare -a PENDING_PATCHES  # "offset|byte_offset|from_hex|to_hex" entries
 
 for site in "${SITES[@]}"; do
-  IFS=: read -r name anchor range <<< "$site"
+  IFS='|' read -r name unpatched patched anchor range byte_off from_hex to_hex <<< "$site"
 
-  read -ra patched <<< "$(find_offsets '.current=!1,' "$anchor" "$range")"
-  read -ra unpatched <<< "$(find_offsets '.current=!0,' "$anchor" "$range")"
+  read -ra patched_offsets <<< "$(find_offsets "$patched" "$anchor" "$range")"
+  read -ra unpatched_offsets <<< "$(find_offsets "$unpatched" "$anchor" "$range")"
 
-  if [[ ${#patched[@]} -gt 0 && "${patched[0]}" != "" ]]; then
-    echo "  $name: patched (${#patched[@]})"
-    ALL_PATCHED=$((ALL_PATCHED + ${#patched[@]}))
-  elif [[ ${#unpatched[@]} -gt 0 && "${unpatched[0]}" != "" ]]; then
-    echo "  $name: unpatched (${#unpatched[@]})"
-    ALL_UNPATCHED=$((ALL_UNPATCHED + ${#unpatched[@]}))
-    PATCH_OFFSETS+=("${unpatched[@]}")
+  if [[ ${#patched_offsets[@]} -gt 0 && "${patched_offsets[0]}" != "" ]]; then
+    echo "  $name: patched (${#patched_offsets[@]})"
+    ALL_PATCHED=$((ALL_PATCHED + ${#patched_offsets[@]}))
+  elif [[ ${#unpatched_offsets[@]} -gt 0 && "${unpatched_offsets[0]}" != "" ]]; then
+    echo "  $name: unpatched (${#unpatched_offsets[@]})"
+    ALL_UNPATCHED=$((ALL_UNPATCHED + ${#unpatched_offsets[@]}))
+    for off in "${unpatched_offsets[@]}"; do
+      PENDING_PATCHES+=("$off|$byte_off|$from_hex|$to_hex")
+    done
   else
     echo "  $name: not found"
   fi
@@ -148,7 +175,7 @@ if [[ $ALL_UNPATCHED -eq 0 && $ALL_PATCHED -eq 0 ]]; then
 fi
 
 echo "Status: unpatched"
-echo "Found ${#PATCH_OFFSETS[@]} occurrence(s) to patch"
+echo "Found ${#PENDING_PATCHES[@]} occurrence(s) to patch"
 
 if [[ "$CHECK_ONLY" == true ]]; then
   exit 0
@@ -164,20 +191,12 @@ else
 fi
 
 # --- Patch ---
-# `.current=!0,` — the `0` is at byte 10 (0-indexed): . c u r r e n t = ! 0
-#                                                      0 1 2 3 4 5 6 7 8 9 10
-for offset in "${PATCH_OFFSETS[@]}"; do
-  patch_offset=$((offset + 10))
-
-  # Verify we're patching the right byte (0x30 = '0')
-  current_hex=$(dd if="$BINARY" bs=1 skip="$patch_offset" count=1 2>/dev/null | xxd -p)
-  if [[ "$current_hex" != "30" ]]; then
-    echo "warning: unexpected byte at offset $patch_offset: 0x$current_hex (expected 0x30), skipping" >&2
-    continue
+for entry in "${PENDING_PATCHES[@]}"; do
+  IFS='|' read -r base_offset byte_off from_hex to_hex <<< "$entry"
+  patch_offset=$((base_offset + byte_off))
+  if patch_byte "$patch_offset" "$from_hex" "$to_hex"; then
+    echo "Patched offset $patch_offset: 0x$from_hex -> 0x$to_hex"
   fi
-
-  printf '\x31' | dd of="$BINARY" bs=1 seek="$patch_offset" conv=notrunc 2>/dev/null
-  echo "Patched offset $patch_offset: !0 -> !1"
 done
 
 # --- Re-sign (required on macOS arm64) ---
