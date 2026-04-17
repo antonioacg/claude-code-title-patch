@@ -103,24 +103,25 @@ if [[ "$RESTORE" == true ]]; then
 fi
 
 # --- Find patterns ---
-# Each patch site has: a grep pattern (unpatched/patched), an anchor string
-# in nearby bytes, a scan range, a byte offset within the pattern to change,
-# and the expected/replacement hex bytes.
+# Each patch site has a mode (byte or replace), a grep pattern (unpatched/patched),
+# an anchor string that must appear within a scan range forward of the pattern,
+# and mode-specific fields for the edit.
 
-# Searches for a pattern and filters by a nearby anchor string.
+# Searches for a literal pattern and filters by a nearby anchor string.
 # Args: $1=pattern, $2=anchor, $3=scan range
 find_offsets() {
   local pattern="$1" anchor="$2" range="${3:-120}"
   local offsets=()
   while IFS=: read -r offset _; do
     offsets+=("$offset")
-  done < <(grep -b -o -a "$pattern" "$BINARY" 2>/dev/null || true)
+  done < <(grep -b -o -a -F "$pattern" "$BINARY" 2>/dev/null || true)
 
   local matches=()
   for offset in "${offsets[@]}"; do
-    local context
-    context=$(dd if="$BINARY" bs=1 skip="$offset" count="$range" 2>/dev/null | strings -n 5)
-    if echo "$context" | grep -q "$anchor"; then
+    # grep -a treats binary input as text; avoids `strings` which truncates
+    # long printable runs (~1024 chars on macOS) and would miss anchors for
+    # long patterns.
+    if dd if="$BINARY" bs=1 skip="$offset" count="$range" 2>/dev/null | grep -qF -a "$anchor"; then
       matches+=("$offset")
     fi
   done
@@ -141,20 +142,54 @@ patch_byte() {
   return 0
 }
 
+# Replace a multi-byte sequence at a given offset with a same-length string.
+# Args: $1=offset, $2=expected string, $3=replacement string
+patch_bytes() {
+  local offset="$1" expected="$2" replacement="$3"
+  if [[ ${#expected} -ne ${#replacement} ]]; then
+    echo "error: expected and replacement differ in length (${#expected} vs ${#replacement})" >&2
+    return 1
+  fi
+  local current
+  current=$(dd if="$BINARY" bs=1 skip="$offset" count="${#expected}" 2>/dev/null)
+  if [[ "$current" != "$expected" ]]; then
+    echo "warning: unexpected bytes at offset $offset, skipping" >&2
+    return 1
+  fi
+  printf '%s' "$replacement" | dd of="$BINARY" bs=1 seek="$offset" conv=notrunc 2>/dev/null
+  return 0
+}
+
 # --- Patch site definitions ---
-# Format: name|unpatched_pattern|patched_pattern|anchor|range|byte_offset|from_hex|to_hex
+# Two formats:
+#   byte:    name|byte|unpatched|patched|anchor|range|byte_offset|from_hex|to_hex
+#   replace: name|replace|unpatched|patched|anchor|range
+# For `replace`, `unpatched` and `patched` must be the same length — the whole
+# pattern is overwritten in place (no byte-shifting).
+
+# Site 5 (titlePriority) is a 1167-byte compressed rewrite of the Vt else-if chain
+# that adds an ai-title handler with priority logic. The sentinel-key trick
+# (O.set("c"+i,1) on custom-title, !O.has("c"+i) guard on ai-title) lets the
+# latest auto-gen topic win while still letting /rename override it. Patterns are
+# factored out as vars because they're ~1.2 KB each. See README for full rationale.
+TITLE_PRIORITY_UNPATCHED='else if(V.type==="custom-title"&&V.sessionId)O.set(V.sessionId,V.customTitle);else if(V.type==="tag"&&V.sessionId)T.set(V.sessionId,V.tag);else if(V.type==="agent-name"&&V.sessionId)$.set(V.sessionId,V.agentName);else if(V.type==="agent-color"&&V.sessionId)A.set(V.sessionId,V.agentColor);else if(V.type==="agent-setting"&&V.sessionId)z.set(V.sessionId,V.agentSetting);else if(V.type==="mode"&&V.sessionId)j.set(V.sessionId,V.mode);else if(V.type==="permission-mode"&&V.sessionId)D.set(V.sessionId,V.permissionMode);else if(V.type==="worktree-state"&&V.sessionId)M.set(V.sessionId,V.worktreeSession);else if(V.type==="pr-link"&&V.sessionId)w.set(V.sessionId,V.prNumber),Y.set(V.sessionId,V.prUrl),f.set(V.sessionId,V.prRepository);else if(V.type==="file-history-snapshot")J.set(V.messageId,V);else if(V.type==="attribution-snapshot")P.clear(),P.set(V.messageId,V);else if(V.type==="content-replacement")if(V.agentId){let C=R.get(V.agentId)??[];R.set(V.agentId,C),C.push(...V.replacements)}else{let C=X.get(V.sessionId)??[];X.set(V.sessionId,C),C.push(...V.replacements)}else if(V.type==="marble-origami-commit")W.push(V);else if(V.type==="marble-origami-snapshot")G=V'
+TITLE_PRIORITY_PATCHED='else{let t=V.type,i=V.sessionId;if(t==="custom-title"&&i)O.set(i,V.customTitle),O.set("c"+i,1);else if(t==="ai-title"&&i&&!O.has("c"+i))O.set(i,V.aiTitle);else if(t==="tag"&&i)T.set(i,V.tag);else if(t==="agent-name"&&i)$.set(i,V.agentName);else if(t==="agent-color"&&i)A.set(i,V.agentColor);else if(t==="agent-setting"&&i)z.set(i,V.agentSetting);else if(t==="mode"&&i)j.set(i,V.mode);else if(t==="permission-mode"&&i)D.set(i,V.permissionMode);else if(t==="worktree-state"&&i)M.set(i,V.worktreeSession);else if(t==="pr-link"&&i)w.set(i,V.prNumber),Y.set(i,V.prUrl),f.set(i,V.prRepository);else if(t==="file-history-snapshot")J.set(V.messageId,V);else if(t==="attribution-snapshot")P.clear(),P.set(V.messageId,V);else if(t==="content-replacement")if(V.agentId){let C=R.get(V.agentId)??[];R.set(V.agentId,C),C.push(...V.replacements)}else{let C=X.get(i)??[];X.set(i,C),C.push(...V.replacements)}else if(t==="marble-origami-commit")W.push(V);else if(t==="marble-origami-snapshot")G=V;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;}'
+
 SITES=(
-  "onBeforeQuery|.current=!0,|.current=!1,|AbortController|120|10|30|31"
-  "sessionResume|.current=!0,|.current=!1,|tengu_session_resumed|300|10|30|31"
-  "guardInit|.length??0)>0)|.length??0)<0)|Claude Code|80|11|3e|3c"
+  "onBeforeQuery|byte|.current=!0,|.current=!1,|AbortController|120|10|30|31"
+  "sessionResume|byte|.current=!0,|.current=!1,|tengu_session_resumed|500|10|30|31"
+  "guardInit|byte|.length??0)>0)|.length??0)<0)|Claude Code|80|11|3e|3c"
+  "persistTitle|replace|(yL)=>{if(yL)LL(yL);else lW.current=!1}|(yL)=>{if(yL)MH6(b_(),yL),Gw8(yL);;;;;}|toolPermissionContext|120"
+  "titlePriority|replace|${TITLE_PRIORITY_UNPATCHED}|${TITLE_PRIORITY_PATCHED}|marble-origami-snapshot|1200"
+  "titleGate|replace|!V&&!\$j&&!X3&&!lW.current|!V&&!!1&&!X3&&!lW.current|AbortController|250"
 )
 
 ALL_PATCHED=0
 ALL_UNPATCHED=0
-declare -a PENDING_PATCHES  # "offset|byte_offset|from_hex|to_hex" entries
+declare -a PENDING_PATCHES  # "byte|offset|byte_off|from|to" or "replace|offset|unpatched|patched"
 
 for site in "${SITES[@]}"; do
-  IFS='|' read -r name unpatched patched anchor range byte_off from_hex to_hex <<< "$site"
+  IFS='|' read -r name mode unpatched patched anchor range byte_off from_hex to_hex <<< "$site"
 
   read -ra patched_offsets <<< "$(find_offsets "$patched" "$anchor" "$range")"
   read -ra unpatched_offsets <<< "$(find_offsets "$unpatched" "$anchor" "$range")"
@@ -166,7 +201,11 @@ for site in "${SITES[@]}"; do
     echo "  $name: unpatched (${#unpatched_offsets[@]})"
     ALL_UNPATCHED=$((ALL_UNPATCHED + ${#unpatched_offsets[@]}))
     for off in "${unpatched_offsets[@]}"; do
-      PENDING_PATCHES+=("$off|$byte_off|$from_hex|$to_hex")
+      if [[ "$mode" == "byte" ]]; then
+        PENDING_PATCHES+=("byte|$off|$byte_off|$from_hex|$to_hex")
+      else
+        PENDING_PATCHES+=("replace|$off|$unpatched|$patched")
+      fi
     done
   else
     echo "  $name: not found"
@@ -205,10 +244,19 @@ fi
 
 # --- Patch ---
 for entry in "${PENDING_PATCHES[@]}"; do
-  IFS='|' read -r base_offset byte_off from_hex to_hex <<< "$entry"
-  patch_offset=$((base_offset + byte_off))
-  if patch_byte "$patch_offset" "$from_hex" "$to_hex"; then
-    echo "Patched offset $patch_offset: 0x$from_hex -> 0x$to_hex"
+  pmode="${entry%%|*}"
+  rest="${entry#*|}"
+  if [[ "$pmode" == "byte" ]]; then
+    IFS='|' read -r base_offset byte_off from_hex to_hex <<< "$rest"
+    patch_offset=$((base_offset + byte_off))
+    if patch_byte "$patch_offset" "$from_hex" "$to_hex"; then
+      echo "Patched offset $patch_offset: 0x$from_hex -> 0x$to_hex"
+    fi
+  else
+    IFS='|' read -r off expected replacement <<< "$rest"
+    if patch_bytes "$off" "$expected" "$replacement"; then
+      echo "Replaced at offset $off: ${#expected} bytes"
+    fi
   fi
 done
 
